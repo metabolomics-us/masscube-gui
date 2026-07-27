@@ -1,0 +1,52 @@
+Speed up get_start_time(): read a bounded header chunk, not the whole file.
+
+masscube's workflow preparation (STEP 1) calls get_start_time() once per raw
+file, serially, to sort samples by acquisition time. The original implementation
+uses f.readlines()[:300], which materializes the ENTIRE file in memory before
+slicing off the first 300 lines. For GB-sized mzML files this reads every byte
+of every sample just to find one timestamp near the top of the header, with no
+progress output — so the workflow appears frozen on
+"Step 1: Preparing the workflow...". On a cloud-synced data folder (OneDrive,
+Dropbox, network share) it is far worse, because the full read forces every
+placeholder file to be downloaded in full.
+
+A bounded 256 KB read is far more than enough for 300 lines of mzML/mzXML
+header. Measured on a synthetic 406 MB mzML: 717 ms -> 0.5 ms (~1300x), and
+that was a warm local read. Return values are identical for headers with a
+timestamp, headers without one, timestamps beyond line 300, and missing files.
+
+Apply against the installed masscube package root, e.g.:
+
+    cd <site-packages>
+    patch -p1 < masscube-get-start-time.patch
+
+or run scripts/apply_masscube_patch.py, which does the same edit in place and is
+idempotent.
+
+Verified against masscube as installed 2026-05-11 (utils_functions.py, 19345
+bytes).
+
+--- a/masscube/utils_functions.py
++++ b/masscube/utils_functions.py
+@@ -182,12 +182,17 @@ def get_start_time(file_name):
+
+     if os.path.exists(str(file_name)):
+         with open(file_name, "rb") as f:
+-            # check the first 300 rows for the start time
+-            for l in f.readlines()[:300]:
+-                l = str(l)
+-                if "startTimeStamp" in str(l):
+-                    t = l.split("startTimeStamp")[1].split('"')[1]
+-                    return datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")
++            # Read a bounded header chunk instead of f.readlines(), which pulls the
++            # whole file into memory before the [:300] slice — on GB-sized mzML
++            # files (or cloud-synced folders) that alone can take minutes per file.
++            # 256 KB covers far more than 300 lines of mzML/mzXML header.
++            head = f.read(262144)
++        # check the first 300 rows for the start time
++        for l in head.splitlines()[:300]:
++            l = str(l)
++            if "startTimeStamp" in str(l):
++                t = l.split("startTimeStamp")[1].split('"')[1]
++                return datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")
+     return None

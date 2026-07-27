@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# MassCube project output, in case a project folder is created inside the repo
+/data/
+/single_files/
+/tmp/
+/ms2_matching/
+/chromatograms/
+/project_files/
+/statistical_analysis/
+/normalization_results/
+parameters.csv
+sample_table.csv
+mzrt_list.csv
+aligned_feature_table.*
+
+# Raw MS data and spectral libraries should never be committed
+*.mzML
+*.mzXML
+*.mzjson
+*.mzjson.gz
+*.msp
+*.msp.bak
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
