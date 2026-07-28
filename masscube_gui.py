@@ -714,6 +714,7 @@ def write_msp_from_feature_table(
     msp_path: Path,
     ion_mode: str = "",
     content: str = "features_with_MS2",
+    isotope_ms1: bool = False,
 ) -> dict:
     """
     Convert a MassCube aligned feature table into an MSP spectral library.
@@ -731,18 +732,28 @@ def write_msp_from_feature_table(
           features_with_MS2 — only features that carry an MS2 spectrum (default)
           annotated_only    — only features with an annotation
           all_features      — every row; MS2-less features get "Num Peaks: 0"
+    isotope_ms1 : bool
+        Write the MS1 isotope pattern alongside MS2 using MS-FINDER's
+        "MSTYPE: MS1" / "MSTYPE: MS2" sections, so a formula search can use
+        isotope abundance. Off by default — a plain MSP stays exactly as it was.
+        Also drops isotope-peak rows and in-source fragments, which are not
+        compounds and would pollute a formula search.
 
     Returns
     -------
-    dict with keys: rows, written, with_peaks, skipped_no_ms2,
-    skipped_unannotated, skipped_no_mz.
+    dict with keys: rows, written, with_peaks, with_isotopes, isotope_peaks,
+    skipped_no_ms2, skipped_unannotated, skipped_no_mz, skipped_isotope_row,
+    skipped_in_source.
     """
 
     if content not in MSP_CONTENT_CHOICES:
         raise ValueError(f"Unknown MSP content option: {content!r}")
 
     stats = {"rows": 0, "written": 0, "with_peaks": 0,
-             "skipped_no_ms2": 0, "skipped_unannotated": 0, "skipped_no_mz": 0}
+             "with_isotopes": 0, "isotope_peaks": 0,
+             "skipped_no_ms2": 0, "skipped_unannotated": 0, "skipped_no_mz": 0,
+             "skipped_isotope_row": 0, "skipped_in_source": 0,
+             "skipped_multimer": 0}
 
     ion_mode_label = ion_mode.strip().capitalize() if ion_mode.strip() else ""
 
@@ -750,6 +761,8 @@ def write_msp_from_feature_table(
         reader = csv.DictReader(src, delimiter="\t")
         fields = reader.fieldnames or []
         missing = [c for c in ("m/z", "RT", "MS2") if c not in fields]
+        if isotope_ms1 and "isotopes" not in fields:
+            missing.append("isotopes")
         if missing:
             raise ValueError(
                 f"{table_path.name} is missing expected column(s): "
@@ -765,6 +778,23 @@ def write_msp_from_feature_table(
                     if not mz:
                         stats["skipped_no_mz"] += 1
                         continue
+
+                    isotopes: list[tuple[float, float]] = []
+                    if isotope_ms1:
+                        # These rows are not compounds — see the module comment.
+                        if _cell_is_true(row, "is_isotope"):
+                            stats["skipped_isotope_row"] += 1
+                            continue
+                        if _cell_is_true(row, "is_in_source_fragment"):
+                            stats["skipped_in_source"] += 1
+                            continue
+                        # [2M+H]+ measures a dimer, so a formula search on it
+                        # describes the cluster rather than the compound.
+                        adduct_cell = _cell(row, "adduct")
+                        if adduct_cell and _MULTIMER_RE.match(adduct_cell):
+                            stats["skipped_multimer"] += 1
+                            continue
+                        isotopes = _parse_isotope_cell(_cell(row, "isotopes"))
 
                     ms2_raw = _cell(row, "MS2")
                     peaks = _parse_ms2_string(ms2_raw) if ms2_raw else []
@@ -806,6 +836,20 @@ def write_msp_from_feature_table(
                     if comment:
                         out.write(f"COMMENT: {comment}\n")
 
+                    if isotope_ms1:
+                        # MS-FINDER's MSP dialect: explicit MS1/MS2 sections, so
+                        # the isotope pattern is read as MS1 rather than as
+                        # fragments. MS1 comes first, matching MS-FINDER's own
+                        # exports.
+                        out.write("MSTYPE: MS1\n")
+                        out.write(f"Num Peaks: {len(isotopes)}\n")
+                        for peak_mz, intensity in isotopes:
+                            out.write(f"{_fmt_num(peak_mz)}\t{_fmt_num(intensity)}\n")
+                        out.write("MSTYPE: MS2\n")
+                        if isotopes:
+                            stats["with_isotopes"] += 1
+                            stats["isotope_peaks"] += len(isotopes)
+
                     out.write(f"Num Peaks: {len(peaks)}\n")
                     for peak_mz, intensity in peaks:
                         out.write(f"{_fmt_num(peak_mz)}\t{_fmt_num(intensity)}\n")
@@ -825,6 +869,327 @@ def write_msp_from_feature_table(
     return stats
 
 
+# ---------------------------------------------------------------------------
+# Formula-ID export (SIRIUS .ms, and MS1-bearing MSP for MS-FINDER).
+#
+# Assigning a molecular formula from accurate m/z + isotope abundance needs the
+# MS1 isotope pattern, not the MS2 spectrum. MassCube keeps it: the feature
+# table's "isotopes" column holds the apex-scan signals as a numpy array repr,
+#   "[[300.1234 1000000.] \n [301.1268 220000.]]"
+# and it *does* include the monoisotopic peak (find_isotope_signals keeps any
+# signal below base_intensity * isotope_rel_int_limit, and that limit defaults
+# to 1.5, i.e. above the base peak).
+#
+# Two caveats that shape the code below:
+#
+#  * Only M+0..M+2 are present. MassCube searches for isotopes at integer Da
+#    offsets (mz + arange(n)) while real 13C spacing is 1.00336 Da, so by M+3
+#    the drift (0.0101) exceeds mz_tol_feature_grouping (0.01) and the peak is
+#    missed. patches/masscube-isotope-spacing.patch fixes this upstream; the
+#    exporter works either way and reports how many isotope peaks it saw.
+#
+#  * Rows with is_isotope=True *are* the M+1/M+2 peaks of other features, and
+#    in-source fragments are not intact molecules. Both are excluded by default
+#    — submitting them yields formulas for things that aren't compounds.
+# ---------------------------------------------------------------------------
+SIRIUS_DIR_NAME = "sirius_input"
+SIRIUS_SINGLE_FILE_NAME = "sirius_input.ms"
+MSFINDER_MSP_FILE_NAME = "aligned_feature_table_msfinder.msp"
+
+# MassCube adduct -> SIRIUS ionization string, for adducts SIRIUS is known to
+# parse. Anything else (formate/acetate/methanol/acetonitrile adducts, metals
+# beyond the common ones) is exported as the SIRIUS wildcard "[M+?]+/-", which
+# tells SIRIUS to consider adducts itself rather than trusting a string it may
+# reject. Add entries here if your SIRIUS build accepts more.
+SIRIUS_IONIZATION_MAP = {
+    "[M+H]+": "[M+H]+",
+    "[M+Na]+": "[M+Na]+",
+    "[M+K]+": "[M+K]+",
+    "[M+NH4]+": "[M+NH4]+",
+    "[M]+": "[M]+",
+    "[M+Li]+": "[M+Li]+",
+    "[M+2H]2+": "[M+2H]2+",
+    "[M+3H]3+": "[M+3H]3+",
+    "[M+H-H2O]+": "[M-H2O+H]+",
+    "[M-H]-": "[M-H]-",
+    "[M+Cl]-": "[M+Cl]-",
+    "[M-2H]2-": "[M-2H]2-",
+    "[M-3H]3-": "[M-3H]3-",
+    "[M-H-H2O]-": "[M-H2O-H]-",
+}
+
+# [2M+H]+, [3M-H]- and friends: the measured mass is a dimer/trimer, so a
+# formula search on it describes the cluster, not the compound. Skipped.
+_MULTIMER_RE = re.compile(r"^\[\s*([2-9]\d*)\s*M")
+
+# Trailing charge of an adduct string: "[M+H]+" -> 1, "[M-2H]2-" -> -2.
+_ADDUCT_CHARGE_RE = re.compile(r"\]\s*(\d*)\s*([+-])\s*$")
+
+# Any float in a numpy array repr, including "3.0012340e+02" scientific form.
+_FLOAT_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+_TRUE_CELL_VALUES = {"true", "1", "yes", "t"}
+
+
+def _cell_is_true(row: dict, col: str) -> bool:
+    """Read a boolean feature-table cell. Missing/blank counts as False."""
+    return _cell(row, col).lower() in _TRUE_CELL_VALUES
+
+
+def _parse_isotope_cell(raw: str) -> list[tuple[float, float]]:
+    """
+    Parse MassCube's "isotopes" cell into [(m/z, intensity), …], m/z ascending.
+
+    The cell is str() of an (n, 2) numpy array, so it spans two physical lines
+    per row and may use scientific notation. numpy elides very large arrays with
+    "...", which would silently drop peaks — refuse those rather than guess.
+    """
+    if not raw or "..." in raw:
+        return []
+    tokens = _FLOAT_RE.findall(raw)
+    if not tokens or len(tokens) % 2:
+        return []
+    peaks: list[tuple[float, float]] = []
+    for i in range(0, len(tokens), 2):
+        try:
+            peaks.append((float(tokens[i]), float(tokens[i + 1])))
+        except ValueError:
+            return []
+    return sorted(peaks)
+
+
+def _adduct_charge(adduct: str, ion_mode: str) -> int:
+    """
+    Charge of an adduct string, falling back to ion mode.
+
+    MassCube drops the `charge` column from the exported table (its export
+    schema marks it export=False), so it has to come from the adduct.
+    """
+    match = _ADDUCT_CHARGE_RE.search(adduct) if adduct else None
+    if match:
+        magnitude = int(match.group(1)) if match.group(1) else 1
+        return magnitude if match.group(2) == "+" else -magnitude
+    return -1 if ion_mode.strip().lower().startswith("neg") else 1
+
+
+def _sirius_ionization(adduct: str, charge: int) -> tuple[str, bool]:
+    """Map an adduct to a SIRIUS ionization string. Returns (value, is_exact)."""
+    mapped = SIRIUS_IONIZATION_MAP.get(adduct)
+    if mapped:
+        return mapped, True
+    return ("[M+?]+" if charge > 0 else "[M+?]-"), False
+
+
+def _safe_stem(text: str) -> str:
+    """Filesystem- and SIRIUS-safe compound id."""
+    cleaned = re.sub(r"[^A-Za-z0-9._+-]+", "_", text).strip("_")
+    return cleaned[:80] or "feature"
+
+
+def write_sirius_ms_from_feature_table(
+    table_path: Path,
+    out_path: Path,
+    ion_mode: str = "",
+    single_file: bool = False,
+    include_ms2: bool = True,
+    require_isotopes: bool = False,
+    skip_in_source_fragments: bool = True,
+) -> dict:
+    """
+    Convert a MassCube aligned feature table into SIRIUS .ms input.
+
+    Parameters
+    ----------
+    table_path : Path
+        aligned_feature_table.txt (tab-separated, as MassCube writes it).
+    out_path : Path
+        Directory to fill with one .ms per feature, or the .ms file to write
+        when single_file is True. Either way it is replaced, not merged.
+    ion_mode : str
+        "positive" / "negative", used only when a row has no adduct.
+    single_file : bool
+        Write every compound into one multi-compound .ms instead of a directory.
+        A directory of per-compound files is the most portable SIRIUS input.
+    include_ms2 : bool
+        Emit >ms2peaks when the feature has an MS2 spectrum. MS2 sharply
+        improves SIRIUS's formula ranking, so this is on by default.
+    require_isotopes : bool
+        Skip features whose isotope pattern has fewer than two peaks. Off by
+        default: SIRIUS can still rank formulas from accurate mass + MS2.
+    skip_in_source_fragments : bool
+        Skip rows flagged is_in_source_fragment.
+
+    Notes
+    -----
+    No >formula line is written even when MassCube annotated the feature —
+    that would pin the answer instead of letting SIRIUS derive it. The
+    annotation is emitted as a "#" comment, which SIRIUS ignores.
+
+    Returns
+    -------
+    dict of counters (see summarize_formula_export_stats).
+    """
+
+    stats = {"rows": 0, "written": 0, "with_isotopes": 0, "with_ms2": 0,
+             "isotope_peaks": 0, "wildcard_adduct": 0, "skipped_isotope_row": 0,
+             "skipped_in_source": 0, "skipped_multimer": 0,
+             "skipped_no_isotopes": 0, "skipped_no_mz": 0}
+
+    with table_path.open("r", newline="", encoding="utf-8-sig") as src:
+        reader = csv.DictReader(src, delimiter="\t")
+        fields = reader.fieldnames or []
+        missing = [c for c in ("m/z", "RT", "isotopes") if c not in fields]
+        if missing:
+            raise ValueError(
+                f"{table_path.name} is missing expected column(s): "
+                f"{', '.join(missing)}. Is this a MassCube aligned feature table?")
+
+        entries: list[tuple[str, str]] = []  # (compound id, .ms body)
+
+        for row in reader:
+            stats["rows"] += 1
+
+            mz_text = _cell(row, "m/z")
+            try:
+                mz = float(mz_text)
+            except ValueError:
+                stats["skipped_no_mz"] += 1
+                continue
+
+            # M+1/M+2 rows describe other features' isotopes, not compounds.
+            if _cell_is_true(row, "is_isotope"):
+                stats["skipped_isotope_row"] += 1
+                continue
+            if skip_in_source_fragments and _cell_is_true(row, "is_in_source_fragment"):
+                stats["skipped_in_source"] += 1
+                continue
+
+            adduct = _cell(row, "adduct")
+            if adduct and _MULTIMER_RE.match(adduct):
+                stats["skipped_multimer"] += 1
+                continue
+
+            isotopes = _parse_isotope_cell(_cell(row, "isotopes"))
+            if require_isotopes and len(isotopes) < 2:
+                stats["skipped_no_isotopes"] += 1
+                continue
+
+            ms2 = _parse_ms2_string(_cell(row, "MS2")) if include_ms2 else []
+            charge = _adduct_charge(adduct, ion_mode)
+            ionization, exact = _sirius_ionization(adduct, charge)
+            if not exact:
+                stats["wildcard_adduct"] += 1
+
+            feature_id = _cell(row, "feature_ID") or str(stats["rows"])
+            # pandas round-trips integer columns as floats: "12.0" -> "12".
+            # (_fmt_num is no help here — with digits=0 it would strip the
+            # trailing zero of a real value and turn 10 into 1.)
+            if feature_id.endswith(".0"):
+                feature_id = feature_id[:-2]
+            annotation = " ".join(_cell(row, "annotation").split())
+            compound = _safe_stem(f"FT{feature_id}")
+
+            lines = [f">compound {compound}",
+                     f">parentmass {_fmt_num(mz, 5)}",
+                     f">charge {charge}",
+                     f">ionization {ionization}"]
+
+            rt_text = _cell(row, "RT")
+            try:
+                # MassCube reports RT in minutes; SIRIUS .ms expects seconds.
+                lines.append(f">rt {_fmt_num(float(rt_text) * 60.0, 2)}s")
+            except ValueError:
+                pass
+
+            if annotation:
+                lines.append(f"#annotation {annotation}")
+            if adduct:
+                lines.append(f"#masscube_adduct {adduct}")
+            if not exact and adduct:
+                lines.append("#note adduct not mapped to SIRIUS, using [M+?]")
+
+            if isotopes:
+                lines.append("")
+                lines.append(">ms1peaks")
+                lines.extend(f"{_fmt_num(p, 5)} {_fmt_num(i, 2)}" for p, i in isotopes)
+                stats["with_isotopes"] += 1
+                stats["isotope_peaks"] += len(isotopes)
+            if ms2:
+                lines.append("")
+                lines.append(">ms2peaks")
+                lines.extend(f"{_fmt_num(p, 5)} {_fmt_num(i, 2)}" for p, i in ms2)
+                stats["with_ms2"] += 1
+
+            entries.append((compound, "\n".join(lines) + "\n"))
+            stats["written"] += 1
+
+    _write_sirius_entries(entries, out_path, single_file)
+    return stats
+
+
+def _write_sirius_entries(entries: list[tuple[str, str]], out_path: Path,
+                          single_file: bool) -> None:
+    """Write .ms entries either as one file or one file per compound."""
+    if single_file:
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8", newline="\n") as out:
+                for _, body in entries:
+                    out.write(body)
+                    out.write("\n")
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        os.replace(tmp_path, out_path)
+        return
+
+    out_path.mkdir(parents=True, exist_ok=True)
+    # Clear previous .ms files so a re-export can't leave stale compounds behind
+    # for SIRIUS to pick up. Only our own extension, never the whole directory.
+    for stale in out_path.glob("*.ms"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    used: set[str] = set()
+    for compound, body in entries:
+        name = compound
+        suffix = 2
+        while name.lower() in used:
+            name = f"{compound}_{suffix}"
+            suffix += 1
+        used.add(name.lower())
+        (out_path / f"{name}.ms").write_text(body, encoding="utf-8", newline="\n")
+
+
+def summarize_formula_export_stats(stats: dict, out_path: Path,
+                                   table_path: Path) -> str:
+    written = stats["written"]
+    lines = [
+        f"Wrote {written} compound{'' if written == 1 else 's'} to:",
+        f"  {out_path}",
+        f"Source: {table_path.name} ({stats['rows']} rows)",
+        f"With MS1 isotope pattern: {stats['with_isotopes']}"
+        f" ({stats['isotope_peaks']} isotope peaks total)",
+        f"With MS2 spectrum: {stats['with_ms2']}",
+    ]
+    if stats["wildcard_adduct"]:
+        lines.append(f"Used [M+?] wildcard ionization for "
+                     f"{stats['wildcard_adduct']} feature(s) with an adduct "
+                     f"SIRIUS may not parse.")
+    for key, label in (("skipped_isotope_row", "isotope peak row(s) of other features"),
+                       ("skipped_in_source", "in-source fragment(s)"),
+                       ("skipped_multimer", "multimer adduct(s) ([2M+H]+ etc.)"),
+                       ("skipped_no_isotopes", "feature(s) without an isotope pattern"),
+                       ("skipped_no_mz", "row(s) without an m/z")):
+        if stats.get(key):
+            lines.append(f"Skipped {stats[key]} {label}.")
+    if written and not stats["with_isotopes"]:
+        lines.append("WARNING: no isotope patterns found. Was the workflow run "
+                     "with feature grouping enabled?")
+    return "\n".join(lines)
+
+
 def summarize_msp_stats(stats: dict, msp_path: Path, table_path: Path) -> str:
     lines = [
         f"Wrote {stats['written']} entr{'y' if stats['written'] == 1 else 'ies'} "
@@ -832,12 +1197,23 @@ def summarize_msp_stats(stats: dict, msp_path: Path, table_path: Path) -> str:
         f"  {msp_path}",
         f"Source: {table_path.name} ({stats['rows']} features)",
     ]
+    if stats.get("with_isotopes"):
+        lines.append(f"With MS1 isotope pattern: {stats['with_isotopes']}"
+                     f" ({stats['isotope_peaks']} isotope peaks total)")
     if stats["skipped_no_ms2"]:
         lines.append(f"Skipped {stats['skipped_no_ms2']} feature(s) without MS2.")
     if stats["skipped_unannotated"]:
         lines.append(f"Skipped {stats['skipped_unannotated']} unannotated feature(s).")
     if stats["skipped_no_mz"]:
         lines.append(f"Skipped {stats['skipped_no_mz']} row(s) without an m/z.")
+    if stats.get("skipped_isotope_row"):
+        lines.append(f"Skipped {stats['skipped_isotope_row']} isotope peak row(s) "
+                     "of other features.")
+    if stats.get("skipped_in_source"):
+        lines.append(f"Skipped {stats['skipped_in_source']} in-source fragment(s).")
+    if stats.get("skipped_multimer"):
+        lines.append(f"Skipped {stats['skipped_multimer']} multimer adduct(s) "
+                     "([2M+H]+ etc.).")
     return "\n".join(lines)
 
 
@@ -918,6 +1294,8 @@ class MassCubeGUI:
                    command=self._save_parameters_only).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="Export MSP",
                    command=self._export_msp_now).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Export for formula ID",
+                   command=self._export_formula_id_now).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="Run workflow",
                    command=self._run_workflow).pack(side="right")
 
@@ -1628,6 +2006,57 @@ class MassCubeGUI:
                 "Export MSP",
                 "No entries matched the selected msp_content option "
                 f"({opts['content']}).\n\n{summary}")
+
+    # ---- formula-ID export ------------------------------------------------
+    def _export_formula_id_now(self):
+        """Write SIRIUS .ms input + an MS1-bearing MSP for MS-FINDER."""
+        proj = self.project_dir.get().strip()
+        if not proj or not os.path.isdir(proj):
+            messagebox.showwarning(
+                "Export for formula ID", "Pick an existing project folder first.")
+            return
+        project = Path(proj)
+        table = find_feature_table(project)
+        if table is None:
+            messagebox.showerror(
+                "Export for formula ID",
+                "No aligned feature table found in:\n"
+                f"{project}\n\nRun the workflow first (the exporter reads "
+                "aligned_feature_table.txt).")
+            return
+
+        ion_mode = self.param_vars["ion_mode"].get().strip()
+        sirius_dir = project / SIRIUS_DIR_NAME
+        msp_path = project / MSFINDER_MSP_FILE_NAME
+
+        self._log("\n[GUI] formula-ID export\n")
+        try:
+            sirius_stats = write_sirius_ms_from_feature_table(
+                table, sirius_dir, ion_mode=ion_mode)
+            msp_stats = write_msp_from_feature_table(
+                table, msp_path, ion_mode=ion_mode,
+                content="all_features", isotope_ms1=True)
+        except Exception as exc:
+            messagebox.showerror("Export for formula ID", f"Export failed:\n{exc}")
+            return
+
+        summary = "\n".join([
+            "SIRIUS (.ms):",
+            summarize_formula_export_stats(sirius_stats, sirius_dir, table),
+            "",
+            "MS-FINDER (.msp, MS1 + MS2):",
+            summarize_msp_stats(msp_stats, msp_path, table),
+        ])
+        for line in summary.splitlines():
+            self._log(f"[GUI] {line}\n")
+
+        if sirius_stats["written"]:
+            messagebox.showinfo("Export for formula ID", summary)
+        else:
+            messagebox.showwarning(
+                "Export for formula ID",
+                "No features were exported — every row was filtered out.\n\n"
+                + summary)
 
     # ---- log helpers ------------------------------------------------------
     def _drain_log_queue(self):

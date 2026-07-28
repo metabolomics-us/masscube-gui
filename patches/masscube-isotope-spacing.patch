@@ -1,0 +1,72 @@
+Search both integer and 13C isotope offset grids, recovering M+3 and M+4.
+
+find_isotope_signals() looks for isotope peaks at offsets `mz + arange(num)` --
+exact integer Da steps. That is a deliberate upstream choice, not an oversight;
+the note at the top of feature_grouping.py says:
+
+    # don't use 1.003355 * charge_state here, because only carbon isotopes
+    # mass diff is larger than 1 Da
+
+and it is correct. Integer offsets keep the sub-1 Da isotopes inside mz_tol:
+
+    15N   +0.99703        34S   +1.99580        37Cl  +1.99705
+
+The gap it leaves is pure carbon. 13C is +1.0033548 per step, so the deviation
+from the integer grid grows by 0.00336 each step and crosses the default
+mz_tol_feature_grouping (0.01) at M+3:
+
+    13C x1  +1.00335   deviation 0.00335   inside  0.01
+    13C x2  +2.00671   deviation 0.00671   inside  0.01
+    13C x3  +3.01006   deviation 0.01006   OUTSIDE 0.01   <-- silently lost
+    13C x4  +4.01342   deviation 0.01342   OUTSIDE 0.01   <-- silently lost
+
+So the `isotopes` column in the feature table only ever carries M+0..M+2. That
+is usually enough, but it caps confidence when assigning a molecular formula
+from isotope abundance, which is what M+3/M+4 constrain best.
+
+Naively switching the grid to 1.0033548 spacing FIXES M+3/M+4 but BREAKS the
+isotopes upstream was protecting -- 34S, 34S+13C and 37Cl x2 all fall outside
+tolerance. So this patch searches BOTH grids and keeps any peak matching either.
+The union is a strict superset of the integer grid, so nothing that matched
+before stops matching. Verified over the common isotopes at tol=0.01, num=5:
+
+    grid                    caught   regressions        newly caught
+    integer (upstream)       10/12   --                 --
+    13C-spaced (naive)        9/12   34S, 34S+13C,      13C x3, 13C x4
+                                     37Cl x2
+    union (this patch)       12/12   none               13C x3, 13C x4
+
+This only affects features detected during a run, so it needs a fresh workflow
+run to change any output.
+
+Apply against the installed masscube package root, e.g.:
+
+    cd <site-packages>
+    patch -p1 < masscube-isotope-spacing.patch
+
+or run scripts/apply_masscube_patch.py, which does the same edit in place and is
+idempotent.
+
+Verified against masscube as installed 2026-05-11 (feature_grouping.py, 18311
+bytes).
+
+--- a/masscube/feature_grouping.py
++++ b/masscube/feature_grouping.py
+@@ -401,7 +401,17 @@ def find_isotope_signals(mz: float, signals: np.array, mz_tol: float = 0.01,
+     idx = np.abs(mzs - mz).argmin()
+     limit = intens[idx] * rel_int_limit
+
+-    targets = mz + np.arange(num, dtype=mzs.dtype)
++    # Search two offset grids, because no single spacing covers every isotope:
++    #   integer steps  -- keeps the sub-1 Da isotopes in range (15N +0.99703,
++    #                     34S +1.99580, 37Cl +1.99705), which is why upstream
++    #                     uses them; see the note at the top of this module.
++    #   13C steps      -- pure carbon drifts +0.00336 per step, so by M+3
++    #                     (+3.01006) it falls outside mz_tol of the integer
++    #                     grid and the peak is silently lost.
++    # The union is a superset of the integer grid, so nothing that matched
++    # before stops matching.
++    steps = np.arange(num, dtype=mzs.dtype)
++    targets = mz + np.concatenate([steps, 1.0033548 * steps])
+     within = np.any(np.abs(mzs[None, :] - targets[:, None]) < mz_tol, axis=0)
+     good_int = intens < limit

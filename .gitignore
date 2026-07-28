@@ -17,10 +17,12 @@ venv/
 /project_files/
 /statistical_analysis/
 /normalization_results/
+/sirius_input/
 parameters.csv
 sample_table.csv
 mzrt_list.csv
 aligned_feature_table.*
+sirius_input.ms
 
 # Raw MS data and spectral libraries should never be committed
 *.mzML
