@@ -355,13 +355,49 @@ def _validate_msp(path: Path) -> dict:
     }
 
 
+def _is_entropy_index(obj) -> bool:
+    """True for a pre-built FlashEntropySearch index — masscube's own .pkl format."""
+    return hasattr(obj, "precursor_mz_array")
+
+
 def _validate_pickled(path: Path) -> dict:
     try:
         with path.open("rb") as f:
             db = pickle.load(f)
     except Exception as exc:
         return {"error": f"Could not load pickle: {exc}"}
+    if _is_entropy_index(db):
+        return _validate_entropy_index(db)
     return _validate_dict_list(db, "pickle")
+
+
+def _validate_entropy_index(db) -> dict:
+    """
+    Validate a pickled FlashEntropySearch index. masscube.annotation._read_pickle
+    accepts any object with precursor_mz_array, then raises if an inner
+    entropy_search lacks intensity_weight (stale database build). Mirror exactly
+    those two checks — the header/precursor checks below don't apply, because
+    precursor m/z and peaks live in the index arrays rather than in text fields.
+    """
+    n = len(db.precursor_mz_array)
+    if n == 0:
+        return {"error": "Pickled index contains no spectra."}
+
+    inner = getattr(db, "entropy_search", None)
+    if inner is not None and not hasattr(inner, "intensity_weight"):
+        return {"error": (
+            "Index built with an incompatible ms_entropy version "
+            "(no intensity_weight attribute). Download the current MassCube "
+            "MS/MS database: https://zenodo.org/records/14991522")}
+
+    return {
+        "total": n, "bad": [], "fixable": [],
+        "bad_unfixable_count": 0, "bad_ms1_count": 0,
+        "bad_ion_mode": [], "bad_ion_mode_unfixable": [],
+        "missing_ion_mode": [], "bad_decimal": [],
+        "decimal_comma_peak_lines": 0,
+        "format": "entropy_index",
+    }
 
 
 def _validate_json(path: Path) -> dict:
